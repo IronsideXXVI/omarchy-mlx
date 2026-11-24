@@ -675,6 +675,11 @@ def make_executor(gm):
             return True
         return isinstance(v, (tuple, list)) and any(has_mx(x) for x in v)
 
+    def has_t(v):
+        if isinstance(v, torch.Tensor):
+            return True
+        return isinstance(v, (tuple, list)) and any(has_t(x) for x in v)
+
     def run(*runtime_inputs):
         env = {}
         it = iter(runtime_inputs)
@@ -704,14 +709,16 @@ def make_executor(gm):
             on_mlx = False
             if node.op == "call_function":
                 tgt = _bd_inner(node.target, args, kwargs)
+                tn = getattr(tgt, "__name__", "")
                 lowering = (FUNC_TABLE.get(tgt)
-                            or FUNC_TABLE_BY_NAME.get(getattr(tgt, "__name__", ""))
+                            or FUNC_TABLE_BY_NAME.get(tn)
+                            or FUNC_TABLE_BY_NAME.get(tn.lstrip("_"))
                             or ATEN_TABLE.get(name))
                 is_producer = (getattr(node.target, "__name__", "") in _PRODUCERS
                                or getattr(node.target, "__name__", "") in _ALWAYS_LOWER
                                or name in _PRODUCERS
                                or name in _ALWAYS_LOWER)
-                if lowering is not None and (has_mx(args) or is_producer):
+                if lowering is not None and (has_mx(args) or has_mx(kwargs.values()) or is_producer or has_t(args) or has_t(kwargs.values())):
                     try:
                         val = lowering(*_deep_mx(args), **{k: _deep_mx(v) for k, v in kwargs.items()})
                         on_mlx = True
@@ -1097,8 +1104,10 @@ def make_compiled_executor(gm):
                 continue
             if n.op == "call_function":
                 tgt = _bd_inner(n.target, args, kwargs)
+                tn = getattr(tgt, "__name__", "")
                 low = (FUNC_TABLE.get(tgt)
-                       or FUNC_TABLE_BY_NAME.get(getattr(tgt, "__name__", ""))
+                       or FUNC_TABLE_BY_NAME.get(tn)
+                       or FUNC_TABLE_BY_NAME.get(tn.lstrip("_"))
                        or ATEN_TABLE.get(name))
                 if low is not None:
                     kw2 = {k: v for k, v in kwargs.items() if k != "device"}
