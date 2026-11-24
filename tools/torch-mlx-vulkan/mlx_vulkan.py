@@ -23,6 +23,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 import mlx.core as mx
+import mlx.nn as _mxnn
 import torch._dynamo
 
 log = logging.getLogger("mlx_vulkan")
@@ -434,6 +435,13 @@ _FUNC_SPECS = {
     "softmax": lambda a, dim=-1, dtype=None, **k: mx.softmax(a, axis=dim),
     "_softmax": lambda a, dim, half=False: mx.softmax(a, axis=dim),
     "gelu": lambda a, approximate="none": (0.5 * a * (1.0 + mx.tanh(math.sqrt(2.0 / math.pi) * (a + 0.044715 * a * a * a))) if approximate == "tanh" else 0.5 * a * (1.0 + mx.erf(a / math.sqrt(2.0)))),
+    "cross_entropy": lambda logits, target, weight=None, ignore_index=-100, reduction="mean", label_smoothing=0.0: (
+        _raise("cross_entropy ignore_index") if ignore_index != -100 else
+        _mxnn.losses.cross_entropy(logits, target, weights=weight, label_smoothing=label_smoothing, reduction=reduction)),
+    "nll_loss": lambda logp, target, weight=None, ignore_index=-100, reduction="mean", size_average=None, reduce=None: (
+        _raise("nll_loss weight/ignore_index") if (weight is not None or ignore_index != -100) else
+        _mxnn.losses.nll_loss(logp, target, reduction=reduction)),
+    "mse_loss": lambda a, b, size_average=None, reduce=None, reduction="mean": _mxnn.losses.mse_loss(a, b, reduction=reduction),
     "silu": lambda a, inplace=False: a * mx.sigmoid(a),
     "relu": lambda a, inplace=False: mx.maximum(a, 0.0),
     "relu_": lambda a: mx.maximum(a, 0.0),
@@ -1079,8 +1087,12 @@ def make_compiled_executor(gm):
                 k = _cast(uk) if uk is not None else _cast(args[1])
                 v = _cast(uv) if uv is not None else _cast(args[2])
                 mask = kwargs.get("attn_mask")
+                if mask is None and kwargs.get("is_causal"):
+                    mask = "causal"
                 env[n] = mx.fast.scaled_dot_product_attention(
-                    q, k, v, scale=kwargs.get("scale"),
+                    q, k, v,
+                    scale=(kwargs.get("scale") if kwargs.get("scale") is not None
+                           else 1.0 / math.sqrt(q.shape[-1])),
                     mask=_cast(mask) if isinstance(mask, mx.array) else mask).astype(mx.float32)
                 continue
             if name in ("matmul", "mm", "bmm") and n.op == "call_function":
