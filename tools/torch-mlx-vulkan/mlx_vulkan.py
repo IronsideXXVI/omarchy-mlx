@@ -13,6 +13,7 @@ op-coverage evidence for the milestone.
 """
 from __future__ import annotations
 
+import inspect
 import logging
 import math
 import operator
@@ -432,9 +433,10 @@ _FUNC_SPECS = {
     "interpolate": _interpolate,
     "softmax": lambda a, dim=-1, dtype=None, **k: mx.softmax(a, axis=dim),
     "_softmax": lambda a, dim, half=False: mx.softmax(a, axis=dim),
-    "gelu": lambda a, approximate="none": a * mx.sigmoid(1.702 * a) if approximate == "tanh" else 0.5 * a * (1.0 + mx.erf(a / math.sqrt(2.0))),
+    "gelu": lambda a, approximate="none": (0.5 * a * (1.0 + mx.tanh(math.sqrt(2.0 / math.pi) * (a + 0.044715 * a * a * a))) if approximate == "tanh" else 0.5 * a * (1.0 + mx.erf(a / math.sqrt(2.0)))),
     "silu": lambda a, inplace=False: a * mx.sigmoid(a),
     "relu": lambda a, inplace=False: mx.maximum(a, 0.0),
+    "relu_": lambda a: mx.maximum(a, 0.0),
     "scaled_dot_product_attention": _sdpa,
     "eq": lambda a, b: mx.equal(_mx(a), _mx(b)),
     "ne": lambda a, b: mx.not_equal(_mx(a), _mx(b)),
@@ -502,10 +504,33 @@ FUNC_TABLE = {}
 _FN_SOURCES = [torch, F, torch.special, operator]
 
 def _resolve(dotted):
-    obj = _FN_SOURCES[0]
-    for part in dotted.split("."):
+    parts = dotted.split(".")
+    obj = globals()[parts[0]]
+    for part in parts[1:]:
         obj = getattr(obj, part)
     return obj
+
+def _bd_inner(tgt, args, kwargs):
+    """Unwrap torch.nn.functional.boolean_dispatch.<locals>.fn closures.
+
+    The wrapper picks if_true/if_false on a boolean argument (e.g.
+    max_pool2d's return_indices). Returns the inner torch function the call
+    resolves to, or the wrapper unchanged when it cannot be read.
+    """
+    if not getattr(tgt, "__qualname__", "").startswith("boolean_dispatch"):
+        return tgt
+    try:
+        nv = inspect.getclosurevars(tgt).nonlocals
+        aname, aidx = nv.get("arg_name"), nv.get("arg_index")
+        use_true = False
+        if aname and aname in kwargs:
+            use_true = bool(kwargs[aname])
+        elif isinstance(aidx, int) and 0 <= aidx < len(args):
+            use_true = bool(args[aidx])
+        inner = nv.get("if_true" if use_true else "if_false")
+        return inner if inner is not None else tgt
+    except Exception:
+        return tgt
 
 def _build_func_table():
     candidates = []
@@ -678,8 +703,9 @@ def make_executor(gm):
             val = None
             on_mlx = False
             if node.op == "call_function":
-                lowering = (FUNC_TABLE.get(node.target)
-                            or FUNC_TABLE_BY_NAME.get(getattr(node.target, "__name__", ""))
+                tgt = _bd_inner(node.target, args, kwargs)
+                lowering = (FUNC_TABLE.get(tgt)
+                            or FUNC_TABLE_BY_NAME.get(getattr(tgt, "__name__", ""))
                             or ATEN_TABLE.get(name))
                 is_producer = (getattr(node.target, "__name__", "") in _PRODUCERS
                                or getattr(node.target, "__name__", "") in _ALWAYS_LOWER
@@ -1070,8 +1096,9 @@ def make_compiled_executor(gm):
                 env[n] = args[0][args[1]]
                 continue
             if n.op == "call_function":
-                low = (FUNC_TABLE.get(n.target)
-                       or FUNC_TABLE_BY_NAME.get(getattr(n.target, "__name__", ""))
+                tgt = _bd_inner(n.target, args, kwargs)
+                low = (FUNC_TABLE.get(tgt)
+                       or FUNC_TABLE_BY_NAME.get(getattr(tgt, "__name__", ""))
                        or ATEN_TABLE.get(name))
                 if low is not None:
                     kw2 = {k: v for k, v in kwargs.items() if k != "device"}
