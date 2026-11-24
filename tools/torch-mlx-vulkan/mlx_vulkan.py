@@ -112,8 +112,16 @@ def _unbind(a, dim):
 def _ln_native(a, normalized_shape, weight, bias, eps):
     w = _mx(weight) if weight is not None else None
     b = _mx(bias) if bias is not None else None
-    dummy = mx.array(np.zeros(1, np.float32))
-    return (mx.fast.layer_norm(a, w, b, eps), dummy, dummy)
+    axes = tuple(range(a.ndim - len(tuple(normalized_shape)), a.ndim))
+    mu = mx.mean(a, axis=axes, keepdims=True)
+    xc = a - mu
+    rstd = 1.0 / mx.sqrt(mx.mean(xc * xc, axis=axes, keepdims=True) + eps)
+    out = xc * rstd
+    if w is not None:
+        out = out * w
+    if b is not None:
+        out = out + b
+    return (out, mu, rstd)
 
 def _expand(a, *s):
     if len(s) == 1 and isinstance(s[0], (list, tuple)):
@@ -148,6 +156,14 @@ def _mean(a, dim=None, keepdim=False, **k):
 
 def _sum(a, dim=None, keepdim=False, **k):
     return mx.sum(a, axis=tuple(dim) if isinstance(dim, (list, tuple)) else dim, keepdims=keepdim)
+
+def _embedding(a, b, *a_, **k_):
+    # F.embedding emits (indices, weight); aten.embedding emits (weight,
+    # indices). Indices are integer dtype, weight is float.
+    _int = (mx.int8, mx.int16, mx.int32, mx.int64,
+            mx.uint8, mx.uint16, mx.uint32, mx.uint64)
+    idx, w = (a, b) if getattr(a, "dtype", None) in _int else (b, a)
+    return _mx(w)[_mx(idx).astype(mx.int32)]
 
 def _sdpa(q, k, v, attn_mask=None, dropout_p=0.0, is_causal=False, scale=None, enable_gqa=False):
     kw = {}
@@ -494,7 +510,7 @@ _FUNC_SPECS = {
     "normalize": lambda x, p=2, dim=1, eps=1e-12: x / mx.maximum(mx.sum(mx.power(mx.abs(x), p), axis=dim, keepdims=True), eps),
     "norm": lambda a, p=2, dim=None, keepdim=False: mx.power(mx.sum(mx.power(mx.abs(a), float(p) if p not in ("inf", "-inf") else 2.0), axis=tuple(dim) if isinstance(dim, (list, tuple)) else dim, keepdims=keepdim), 1.0 / (float(p) if p not in ("inf", "-inf") else 2.0)),
     "rms_norm": lambda a, ns, w=None, eps=None: mx.fast.rms_norm(a, _mx(w) if w is not None else None, eps if eps is not None else 1e-6),
-    "embedding": lambda idx, w, *a_, **k_: _mx(w)[_mx(idx).astype(mx.int32)],
+    "embedding": _embedding,
     "all": lambda a, dim=None, keepdim=False: mx.all(a, axis=tuple(dim) if isinstance(dim, (list, tuple)) else dim, keepdims=keepdim),
     "any": lambda a, dim=None, keepdim=False: mx.any(a, axis=tuple(dim) if isinstance(dim, (list, tuple)) else dim, keepdims=keepdim),
     "count_nonzero": lambda a, dim=None: mx.sum((a != 0).astype(mx.int32), axis=dim),
@@ -557,7 +573,7 @@ def _build_func_table():
         ("torch.nn.functional.softmax", _FUNC_SPECS["softmax"]),
         ("torch.nn.functional.scaled_dot_product_attention", _sdpa),
         ("torch.nn.functional.dropout", _FUNC_SPECS["dropout"]),
-        ("torch.nn.functional.embedding", lambda idx, w, *a_, **k_: _mx(w)[_mx(idx).astype(mx.int32)]),
+        ("torch.nn.functional.embedding", _embedding),
         ("operator.getitem", lambda t, i: t[i]),
         ("operator.matmul", mx.matmul),
         ("operator.add", _FUNC_SPECS["add"]),
@@ -983,6 +999,8 @@ def make_compiled_executor(gm):
     def _cast(x, dt=_DT):
         return x.astype(dt) if isinstance(x, mx.array) and x.dtype != dt else x
 
+    meta = {"tuple_out": True}
+
     def build(*flat):
         env = {}
         for n, v in zip(phs, flat):
@@ -1002,7 +1020,8 @@ def make_compiled_executor(gm):
             if n.op == "output":
                 out = res(n.args[0])
                 tail = [env[m] for m in mutated]
-                return (*out, *tail) if isinstance(out, (tuple, list)) else (out, *tail)
+                meta["tuple_out"] = isinstance(out, (tuple, list))
+                return (*out, *tail) if meta["tuple_out"] else (out, *tail)
             if n.op == "get_attr":
                 t = gm
                 for part in str(n.target).split("."):
@@ -1173,10 +1192,12 @@ def make_compiled_executor(gm):
         outs = cfn(*flat)
         mx.eval(*outs)
         t2 = _t.perf_counter()
-        logits, extra = outs[0], outs[1:]
+        n_true = len(outs) - len(mutated)
+        real, extra = outs[:n_true], outs[n_true:]
         for m, arr in zip(mutated, extra):
             state[str(m.target)] = arr
-        out = _torch(logits)
+        out = (tuple(_torch(o) for o in real) if meta["tuple_out"]
+               else _torch(real[0]))
         t3 = _t.perf_counter()
         if _profile:
             _acc["prep"] += t1 - t0; _acc["cfn"] += t2 - t1; _acc["conv"] += t3 - t2; _acc["n"] += 1
