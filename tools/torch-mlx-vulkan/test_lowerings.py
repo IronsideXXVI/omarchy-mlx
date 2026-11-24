@@ -70,8 +70,52 @@ def test_dispatch_registered():
     print("test_dispatch_registered PASS")
 
 
+def test_where_masked_fill():
+    # PT-AA: aten.where.self (PAR-41 census rank 25, 900 uses, already
+    # lowered) and aten.masked_fill.Tensor/Scalar/_ (registered but no
+    # Tensor-variant coverage). Prove lowering + dtype promotion + parity
+    # at fp32/fp16/bf16 with a shared bool-mask digest.
+    cond = torch.tensor([True, False, True, False])
+    x32, y32 = torch.tensor([1.0, -2.0, 3.5, -4.0]), torch.tensor([0.5, 2.0, -1.0, 4.0])
+    cases = [
+        (torch.ops.aten.where.self, (cond, x32, y32)),
+        (torch.ops.aten.where.self, (cond, x32, torch.tensor([1, 2, 3, 4]))),
+        (torch.ops.aten.where.self, (cond, x32.half(), y32)),
+        (torch.ops.aten.where.self, (cond, x32.bfloat16(), y32)),
+        (torch.ops.aten.where.self, (cond, torch.tensor([1, 2, 3, 4]),
+                                    torch.tensor([5, 6, 7, 8], dtype=torch.int32))),
+        (torch.ops.aten.masked_fill.Scalar, (x32, cond, 9.0)),
+        (torch.ops.aten.masked_fill.Tensor, (x32, cond, torch.tensor(9.0))),
+        (torch.ops.aten.masked_fill.Scalar, (x32.bfloat16(), cond, 2.5)),
+        (torch.ops.aten.masked_fill.Scalar, (x32.half(), cond, 2.5)),
+        (torch.ops.aten.masked_fill_.Scalar, (x32.clone(), cond, 9.0)),
+        (torch.ops.aten.masked_fill.Scalar, (torch.randn(2, 3),
+                                             torch.tensor([[True], [False]]), 7.0)),
+    ]
+    for target, ins in cases:
+        ref = target(*ins)
+        g = torch.fx.Graph()
+        targs = [a for a in ins if torch.is_tensor(a)]
+        phs = [g.placeholder(f"p{i}") for i in range(len(targs))]
+        pit = iter(phs)
+        args = tuple(next(pit) if torch.is_tensor(a) else a for a in ins)
+        n = g.call_function(target, args, {})
+        g.output(n)
+        gm = torch.fx.GraphModule(torch.nn.Module(), g)
+        run, stats = mlx_vulkan.make_executor(gm)
+        out = run(*targs)
+        assert stats["cpu"] == [], (stats, str(target))
+        fam = "where" if "where" in str(target) else "masked_fill"
+        assert any(fam in s for s in stats["mlx"]), (stats, str(target))
+        got = torch.as_tensor(out)
+        assert got.dtype == ref.dtype, (str(target), got.dtype, ref.dtype)
+        assert torch.equal(got.float(), ref.float()), (str(target), got, ref)
+    print("test_where_masked_fill PASS")
+
+
 if __name__ == "__main__":
     test_topk()
     test_multinomial()
     test_dispatch_registered()
+    test_where_masked_fill()
     print("ALL PASS")
