@@ -1216,6 +1216,12 @@ enum class ComputeKernel : uint16_t {
   // shaders/qmm_coopmat16_bf16.comp). Appended to keep profile kernel
   // ids stable.
   QmmPrefillCoopmat16BF16,
+  // bf16-operand 16x16x16 causal flash prefill for parts whose driver
+  // advertises only the WMMA-shaped bf16 x bf16 -> f32 subgroup shape
+  // (RADV RDNA3+; shaders/sdpa_prefill_flash_causal_coopmat16.comp),
+  // one 64-lane subgroup per workgroup. Appended to keep profile kernel
+  // ids stable.
+  SdpaCausalFlashCoopmat16BF16,
   Count,
 };
 

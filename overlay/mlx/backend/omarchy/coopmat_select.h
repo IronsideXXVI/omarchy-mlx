@@ -91,4 +91,11 @@ CoopmatShape qmm_prefill_coopmat_shape();
 // listing only the fp32 shape keeps the fp32 route.
 CoopmatShape qmm_prefill_coopmat16_bf16_shape();
 
+// The 16x16x16 subgroup shape the RDNA/RADV causal flash prefill variant
+// (shaders/sdpa_prefill_flash_causal_coopmat16.comp) emits: bf16 A and B
+// operands with an fp32 accumulator and result, non-saturating. Same
+// advertised shape the qmm 16x16x16 route needs; a separate function so
+// each call site names the kernel family it feeds.
+CoopmatShape sdpa_causal_flash_coopmat16_bf16_shape();
+
 } // namespace mlx::core::omarchy
